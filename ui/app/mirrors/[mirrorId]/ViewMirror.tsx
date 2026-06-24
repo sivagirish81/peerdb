@@ -60,7 +60,12 @@ export default function ViewMirror({
           />
         </div>
         <CDCMirror
-          syncStatusChild={<SyncStatus flowJobName={mirrorId} />}
+          syncStatusChild={
+            <SyncStatus
+              flowJobName={mirrorId}
+              sourceType={dBTypeFromJSON(mirrorState.cdcStatus.sourceType)}
+            />
+          }
           status={mirrorState}
         />
       </LayoutMain>

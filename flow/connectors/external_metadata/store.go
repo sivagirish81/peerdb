@@ -165,6 +165,24 @@ func (p *PostgresMetadata) GetLastOffset(ctx context.Context, jobName string) (m
 	return offset, nil
 }
 
+func (p *PostgresMetadata) GetLastOffsetMetadata(ctx context.Context, jobName string) (model.CdcCheckpointMetadata, error) {
+	var metadata model.CdcCheckpointMetadata
+	if err := p.pool.QueryRow(ctx,
+		`SELECT last_offset, last_text, updated_at FROM `+lastSyncStateTableName+` WHERE job_name = $1`,
+		jobName,
+	).Scan(&metadata.Checkpoint.ID, &metadata.Checkpoint.Text, &metadata.UpdatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return metadata, nil
+		}
+
+		p.logger.Error("failed to get last offset metadata", slog.Any("error", err))
+		return metadata, err
+	}
+
+	metadata.Exists = true
+	return metadata, nil
+}
+
 func (p *PostgresMetadata) GetLastSyncBatchID(ctx context.Context, jobName string) (int64, error) {
 	var syncBatchID pgtype.Int8
 	if err := p.pool.QueryRow(ctx,

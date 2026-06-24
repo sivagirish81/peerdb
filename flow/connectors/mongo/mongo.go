@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -52,12 +53,29 @@ var protoToReadPref = map[protos.ReadPreference]*readpref.ReadPref{
 
 type metadataStore interface {
 	GetLastOffset(ctx context.Context, jobName string) (model.CdcCheckpoint, error)
+	GetLastOffsetMetadata(ctx context.Context, jobName string) (model.CdcCheckpointMetadata, error)
 	SetLastOffset(ctx context.Context, jobName string, offset model.CdcCheckpoint) error
 }
 
 type createChangeStreamFunc func(
 	ctx context.Context, pipeline mongo.Pipeline, opts ...options.Lister[options.ChangeStreamOptions],
 ) (ChangeStream, error)
+
+type getReplSetStatusFunc func(ctx context.Context, client *mongo.Client) (peerdb_mongo.ReplSetStatus, error)
+
+var (
+	ErrReadMongoReplicationStatus = errors.New("read MongoDB replication status")
+	ErrReadMongoCheckpoint        = errors.New("read persisted MongoDB checkpoint")
+	ErrDecodeMongoCheckpoint      = errors.New("decode persisted MongoDB checkpoint")
+)
+
+type MongoReplicationStatus struct {
+	CurrentPosition       bson.Timestamp
+	ProcessedPosition     bson.Timestamp
+	LagSeconds            int64
+	CheckpointUpdatedAt   time.Time
+	CheckpointInitialized bool
+}
 
 type MongoConnector struct {
 	logger             log.Logger
@@ -66,6 +84,7 @@ type MongoConnector struct {
 	client             *mongo.Client
 	ssh                *utils.SSHTunnel
 	createChangeStream createChangeStreamFunc
+	getReplSetStatus   getReplSetStatusFunc
 	totalBytesRead     atomic.Int64
 	deltaBytesRead     atomic.Int64
 }
@@ -91,6 +110,7 @@ func NewMongoConnector(ctx context.Context, config *protos.MongoConfig) (*MongoC
 		}
 		return &changeStreamWrapper{ChangeStream: cs}, nil
 	}
+	mc.getReplSetStatus = peerdb_mongo.GetReplSetStatus
 
 	sshTunnel, err := utils.NewSSHTunnel(ctx, config.SshConfig)
 	if err != nil {
@@ -212,37 +232,54 @@ func (c *MongoConnector) GetTableSizeEstimatedBytes(ctx context.Context, tableId
 	return collStats.Size, nil
 }
 
-// GetServerSideCommitLagMicroseconds returns the commit lag between the latest WAL write
+func (c *MongoConnector) GetReplicationStatus(ctx context.Context, flowJobName string) (*MongoReplicationStatus, error) {
+	getReplSetStatus := c.getReplSetStatus
+	if getReplSetStatus == nil {
+		getReplSetStatus = peerdb_mongo.GetReplSetStatus
+	}
+	replSetStatus, err := getReplSetStatus(ctx, c.client)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrReadMongoReplicationStatus, err)
+	}
+	currentPosition := replSetStatus.OpTimes.LastCommittedOpTime.Ts
+
+	checkpointMetadata, err := c.metadataStore.GetLastOffsetMetadata(ctx, flowJobName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrReadMongoCheckpoint, err)
+	}
+
+	status := &MongoReplicationStatus{
+		CurrentPosition: currentPosition,
+	}
+	if !checkpointMetadata.Exists || checkpointMetadata.Checkpoint.Text == "" {
+		return status, nil
+	}
+
+	resumeToken, err := base64.StdEncoding.DecodeString(checkpointMetadata.Checkpoint.Text)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid base64 resume token: %v", ErrDecodeMongoCheckpoint, err)
+	}
+	processedPosition, err := decodeTimestampFromResumeToken(resumeToken)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid resume token timestamp: %v", ErrDecodeMongoCheckpoint, err)
+	}
+
+	status.ProcessedPosition = processedPosition
+	status.CheckpointUpdatedAt = checkpointMetadata.UpdatedAt
+	status.CheckpointInitialized = true
+	status.LagSeconds = max(int64(currentPosition.T)-int64(processedPosition.T), 0)
+	return status, nil
+}
+
+// GetServerSideCommitLagMicroseconds returns the commit lag between the latest committed oplog position
 // and the last consumed event. Both timestamps come from the MongoDB server to avoid clock skew.
 func (c *MongoConnector) GetServerSideCommitLagMicroseconds(ctx context.Context, flowJobName string) (int64, error) {
-	replSetStatus, err := peerdb_mongo.GetReplSetStatus(ctx, c.client)
+	status, err := c.GetReplicationStatus(ctx, flowJobName)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get replica set status: %w", err)
+		return 0, err
 	}
-
-	lastOffset, err := c.metadataStore.GetLastOffset(ctx, flowJobName)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get last offset: %w", err)
-	}
-
-	if lastOffset.Text == "" {
+	if !status.CheckpointInitialized {
 		return 0, fmt.Errorf("last offset is empty string, cannot calculate commit lag")
 	}
-
-	resumeToken, err := base64.StdEncoding.DecodeString(lastOffset.Text)
-	if err != nil {
-		return 0, fmt.Errorf("failed to decode resume token: %w", err)
-	}
-	clusterTime, err := decodeTimestampFromResumeToken(resumeToken)
-	if err != nil {
-		return 0, fmt.Errorf("failed to decode timestamp from resume token: %w", err)
-	}
-
-	latestWALTime := replSetStatus.OpTimes.LastCommittedOpTime.Ts
-
-	lagSeconds := max(int64(latestWALTime.T)-int64(clusterTime.T), 0)
-
-	lagMicroseconds := lagSeconds * 1_000_000
-
-	return lagMicroseconds, nil
+	return status.LagSeconds * 1_000_000, nil
 }
