@@ -147,6 +147,40 @@ message CDCTableTotalCountsResponse {
   repeated CDCTableRowCounts tables_data = 2;
 }
 
+message OplogTimestamp {
+  uint32 seconds = 1;
+  uint32 increment = 2;
+}
+
+message MongoReplicationStatus {
+  OplogTimestamp current_position = 1;
+  OplogTimestamp processed_position = 2;
+}
+
+enum ReplicationStatusState {
+  REPLICATION_STATUS_STATE_UNSPECIFIED = 0;
+  REPLICATION_STATUS_STATE_RUNNING = 1;
+  REPLICATION_STATUS_STATE_INITIALIZING = 2;
+  REPLICATION_STATUS_STATE_PAUSED = 3;
+  REPLICATION_STATUS_STATE_UNAVAILABLE = 4;
+}
+
+message ReplicationStatusRequest { string flow_job_name = 1; }
+
+message ReplicationStatusResponse {
+  string flow_job_name = 1;
+  ReplicationStatusState state = 2;
+  int64 lag_seconds = 3;
+  google.protobuf.Timestamp checkpoint_updated_at = 4;
+  google.protobuf.Timestamp observed_at = 5;
+  int64 configured_sync_interval_seconds = 6;
+  string message = 7;
+
+  oneof source_status {
+    MongoReplicationStatus mongo = 8;
+  }
+}
+
 message TotalRowsSyncedByMirrorRequest {
   string flow_job_name = 1;
   bool exclude_cdc = 2; // if true, only initial load rows are counted
@@ -632,6 +666,13 @@ service FlowService {
       returns (CDCTableTotalCountsResponse) {
     option (google.api.http) = {
       get : "/v1/mirrors/cdc/table_total_counts/{flow_job_name}"
+    };
+  }
+
+  rpc GetReplicationStatus(ReplicationStatusRequest)
+      returns (ReplicationStatusResponse) {
+    option (google.api.http) = {
+      get : "/v1/mirrors/cdc/replication-status/{flow_job_name}"
     };
   }
 

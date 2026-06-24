@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/otel_metrics"
+	peerdb_mongo "github.com/PeerDB-io/peerdb/flow/pkg/mongo"
 	"github.com/PeerDB-io/peerdb/flow/shared"
 )
 
@@ -78,13 +80,35 @@ func (cs *mockChangeStream) Close(context.Context) error { return nil }
 
 var _ ChangeStream = (*mockChangeStream)(nil)
 
-type mockMetadataStore struct{ persisted []model.CdcCheckpoint }
+type mockMetadataStore struct {
+	persisted []model.CdcCheckpoint
+
+	checkpointMetadata model.CdcCheckpointMetadata
+	getMetadataErr     error
+}
 
 func (ms *mockMetadataStore) GetLastOffset(context.Context, string) (model.CdcCheckpoint, error) {
 	if n := len(ms.persisted); n > 0 {
 		return ms.persisted[n-1], nil
 	}
 	return model.CdcCheckpoint{}, nil
+}
+
+func (ms *mockMetadataStore) GetLastOffsetMetadata(context.Context, string) (model.CdcCheckpointMetadata, error) {
+	if ms.getMetadataErr != nil {
+		return model.CdcCheckpointMetadata{}, ms.getMetadataErr
+	}
+	if ms.checkpointMetadata.Exists || ms.checkpointMetadata.Checkpoint.Text != "" {
+		return ms.checkpointMetadata, nil
+	}
+	if n := len(ms.persisted); n > 0 {
+		return model.CdcCheckpointMetadata{
+			Checkpoint: ms.persisted[n-1],
+			UpdatedAt:  time.Now().UTC(),
+			Exists:     true,
+		}, nil
+	}
+	return model.CdcCheckpointMetadata{}, nil
 }
 
 func (ms *mockMetadataStore) SetLastOffset(_ context.Context, _ string, off model.CdcCheckpoint) error {
@@ -278,4 +302,161 @@ func TestDecodeEvent(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func testMongoConnectorForStatus(
+	t *testing.T,
+	current bson.Timestamp,
+	store *mockMetadataStore,
+) *MongoConnector {
+	t.Helper()
+	return &MongoConnector{
+		logger:        internal.LoggerFromCtx(t.Context()),
+		metadataStore: store,
+		getReplSetStatus: func(context.Context, *mongo.Client) (peerdb_mongo.ReplSetStatus, error) {
+			return peerdb_mongo.ReplSetStatus{
+				OpTimes: peerdb_mongo.OpTimes{
+					LastCommittedOpTime: peerdb_mongo.OpTime{Ts: current},
+				},
+			}, nil
+		},
+	}
+}
+
+func checkpointMetadataFromTimestamp(ts bson.Timestamp) model.CdcCheckpointMetadata {
+	return model.CdcCheckpointMetadata{
+		Checkpoint: model.CdcCheckpoint{
+			Text: b64(toResumeToken(time.Unix(int64(ts.T), int64(ts.I)).UTC())),
+		},
+		UpdatedAt: time.Unix(1234, 0).UTC(),
+		Exists:    true,
+	}
+}
+
+func TestMongoReplicationStatusNormalCase(t *testing.T) {
+	ctx := t.Context()
+	current := bson.Timestamp{T: 200, I: 4}
+	processed := bson.Timestamp{T: 195, I: 9}
+	connector := testMongoConnectorForStatus(t, current, &mockMetadataStore{
+		checkpointMetadata: checkpointMetadataFromTimestamp(processed),
+	})
+
+	status, err := connector.GetReplicationStatus(ctx, "mongo_flow")
+	require.NoError(t, err)
+	require.True(t, status.CheckpointInitialized)
+	require.Equal(t, current, status.CurrentPosition)
+	require.Equal(t, processed, status.ProcessedPosition)
+	require.EqualValues(t, 5, status.LagSeconds)
+
+	lagMicros, err := connector.GetServerSideCommitLagMicroseconds(ctx, "mongo_flow")
+	require.NoError(t, err)
+	require.EqualValues(t, 5_000_000, lagMicros)
+}
+
+func TestMongoReplicationStatusSameSecondLagIsZero(t *testing.T) {
+	current := bson.Timestamp{T: 200, I: 9}
+	processed := bson.Timestamp{T: 200, I: 2}
+	connector := testMongoConnectorForStatus(t, current, &mockMetadataStore{
+		checkpointMetadata: checkpointMetadataFromTimestamp(processed),
+	})
+
+	status, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.NoError(t, err)
+	require.Equal(t, current, status.CurrentPosition)
+	require.Equal(t, processed, status.ProcessedPosition)
+	require.Zero(t, status.LagSeconds)
+}
+
+func TestMongoReplicationStatusNegativeLagIsClamped(t *testing.T) {
+	current := bson.Timestamp{T: 195, I: 1}
+	processed := bson.Timestamp{T: 200, I: 1}
+	connector := testMongoConnectorForStatus(t, current, &mockMetadataStore{
+		checkpointMetadata: checkpointMetadataFromTimestamp(processed),
+	})
+
+	status, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.NoError(t, err)
+	require.Zero(t, status.LagSeconds)
+}
+
+func TestMongoReplicationStatusEmptyCheckpointInitializes(t *testing.T) {
+	current := bson.Timestamp{T: 200, I: 4}
+	connector := testMongoConnectorForStatus(t, current, &mockMetadataStore{
+		checkpointMetadata: model.CdcCheckpointMetadata{Exists: true},
+	})
+
+	status, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.NoError(t, err)
+	require.False(t, status.CheckpointInitialized)
+	require.Equal(t, current, status.CurrentPosition)
+}
+
+func TestMongoReplicationStatusMissingCheckpointInitializes(t *testing.T) {
+	current := bson.Timestamp{T: 200, I: 4}
+	connector := testMongoConnectorForStatus(t, current, &mockMetadataStore{})
+
+	status, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.NoError(t, err)
+	require.False(t, status.CheckpointInitialized)
+	require.Equal(t, current, status.CurrentPosition)
+}
+
+func TestMongoReplicationStatusMalformedBase64(t *testing.T) {
+	connector := testMongoConnectorForStatus(t, bson.Timestamp{T: 200, I: 4}, &mockMetadataStore{
+		checkpointMetadata: model.CdcCheckpointMetadata{
+			Checkpoint: model.CdcCheckpoint{Text: "not base64"},
+			Exists:     true,
+		},
+	})
+
+	_, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.ErrorIs(t, err, ErrDecodeMongoCheckpoint)
+}
+
+func TestMongoReplicationStatusInvalidBSONResumeToken(t *testing.T) {
+	connector := testMongoConnectorForStatus(t, bson.Timestamp{T: 200, I: 4}, &mockMetadataStore{
+		checkpointMetadata: model.CdcCheckpointMetadata{
+			Checkpoint: model.CdcCheckpoint{Text: base64.StdEncoding.EncodeToString([]byte{1, 2, 3})},
+			Exists:     true,
+		},
+	})
+
+	_, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.ErrorIs(t, err, ErrDecodeMongoCheckpoint)
+}
+
+func TestMongoReplicationStatusResumeTokenWithoutTimestamp(t *testing.T) {
+	raw, err := bson.Marshal(bson.D{{Key: "_data", Value: ""}})
+	require.NoError(t, err)
+	connector := testMongoConnectorForStatus(t, bson.Timestamp{T: 200, I: 4}, &mockMetadataStore{
+		checkpointMetadata: model.CdcCheckpointMetadata{
+			Checkpoint: model.CdcCheckpoint{Text: base64.StdEncoding.EncodeToString(raw)},
+			Exists:     true,
+		},
+	})
+
+	_, err = connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.ErrorIs(t, err, ErrDecodeMongoCheckpoint)
+}
+
+func TestMongoReplicationStatusSourceCommandFailure(t *testing.T) {
+	connector := &MongoConnector{
+		logger:        internal.LoggerFromCtx(t.Context()),
+		metadataStore: &mockMetadataStore{},
+		getReplSetStatus: func(context.Context, *mongo.Client) (peerdb_mongo.ReplSetStatus, error) {
+			return peerdb_mongo.ReplSetStatus{}, errors.New("permission denied")
+		},
+	}
+
+	_, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.ErrorIs(t, err, ErrReadMongoReplicationStatus)
+}
+
+func TestMongoReplicationStatusMetadataFailure(t *testing.T) {
+	connector := testMongoConnectorForStatus(t, bson.Timestamp{T: 200, I: 4}, &mockMetadataStore{
+		getMetadataErr: errors.New("catalog unavailable"),
+	})
+
+	_, err := connector.GetReplicationStatus(t.Context(), "mongo_flow")
+	require.ErrorIs(t, err, ErrReadMongoCheckpoint)
 }

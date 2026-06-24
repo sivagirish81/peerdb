@@ -30,6 +30,12 @@ type CdcCheckpoint struct {
 	ID   int64
 }
 
+type CdcCheckpointMetadata struct {
+	Checkpoint CdcCheckpoint
+	UpdatedAt  time.Time
+	Exists     bool
+}
+
 func NewCDCStream[T Items](channelBuffer int) *CDCStream[T] {
 	return &CDCStream[T]{
 		records:            make(chan Record[T], channelBuffer),

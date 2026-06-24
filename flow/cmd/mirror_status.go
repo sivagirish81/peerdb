@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/PeerDB-io/peerdb/flow/connectors"
+	connmongo "github.com/PeerDB-io/peerdb/flow/connectors/mongo"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/shared"
@@ -212,6 +213,140 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		CdcBatches: cdcBatches,
 		RowsSynced: rowsSynced,
 	}, nil
+}
+
+func oplogTimestampToProto(ts connmongo.MongoReplicationStatus) *protos.MongoReplicationStatus {
+	mongoStatus := &protos.MongoReplicationStatus{
+		CurrentPosition: &protos.OplogTimestamp{
+			Seconds:   ts.CurrentPosition.T,
+			Increment: ts.CurrentPosition.I,
+		},
+	}
+	if ts.CheckpointInitialized {
+		mongoStatus.ProcessedPosition = &protos.OplogTimestamp{
+			Seconds:   ts.ProcessedPosition.T,
+			Increment: ts.ProcessedPosition.I,
+		}
+	}
+	return mongoStatus
+}
+
+func replicationStatusUnavailableResponse(
+	flowJobName string,
+	observedAt time.Time,
+	configuredSyncIntervalSeconds int64,
+	err error,
+) *protos.ReplicationStatusResponse {
+	message := "Unable to read MongoDB replication status."
+	switch {
+	case errors.Is(err, connmongo.ErrReadMongoCheckpoint):
+		message = "Unable to read the persisted PeerDB checkpoint."
+	case errors.Is(err, connmongo.ErrDecodeMongoCheckpoint):
+		message = "Unable to decode the persisted MongoDB checkpoint."
+	}
+	return &protos.ReplicationStatusResponse{
+		FlowJobName:                   flowJobName,
+		State:                         protos.ReplicationStatusState_REPLICATION_STATUS_STATE_UNAVAILABLE,
+		ObservedAt:                    timestamppb.New(observedAt),
+		ConfiguredSyncIntervalSeconds: configuredSyncIntervalSeconds,
+		Message:                       message,
+	}
+}
+
+func (h *FlowRequestHandler) GetReplicationStatus(
+	ctx context.Context,
+	req *protos.ReplicationStatusRequest,
+) (*protos.ReplicationStatusResponse, APIError) {
+	flowJobName := strings.TrimSpace(req.FlowJobName)
+	if flowJobName == "" {
+		return nil, NewInvalidArgumentApiError(fmt.Errorf("flow_job_name is required"))
+	}
+
+	isCDCFlow, err := h.isCDCFlow(ctx, flowJobName)
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("unable to query mirror %s: %w", flowJobName, err))
+	}
+	if !isCDCFlow {
+		return nil, NewFailedPreconditionApiError(fmt.Errorf("replication status is only supported for CDC mirrors"))
+	}
+
+	config, err := h.getFlowConfigFromCatalog(ctx, flowJobName)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, NewNotFoundApiError(fmt.Errorf("flow %s not found", flowJobName))
+		}
+		return nil, NewInternalApiError(fmt.Errorf("unable to query flow config for mirror %s: %w", flowJobName, err))
+	}
+
+	sourceType, err := connectors.LoadPeerType(ctx, h.pool, config.SourceName)
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("unable to load source peer type for mirror %s: %w", flowJobName, err))
+	}
+	if sourceType != protos.DBType_MONGO {
+		return nil, NewFailedPreconditionApiError(fmt.Errorf("replication status is only supported for MongoDB CDC mirrors"))
+	}
+
+	workflowID, err := h.getWorkflowID(ctx, flowJobName)
+	if err != nil {
+		if _, ok := errors.AsType[*exceptions.NotFoundError](err); ok {
+			return nil, NewNotFoundApiError(fmt.Errorf("flow %s not found", flowJobName))
+		}
+		return nil, NewInternalApiError(fmt.Errorf("unable to get workflow ID for mirror %s: %w", flowJobName, err))
+	}
+
+	flowStatus, err := h.getWorkflowStatus(ctx, workflowID)
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("unable to get workflow status for mirror %s: %w", flowJobName, err))
+	}
+
+	configuredSyncIntervalSeconds := int64(config.IdleTimeoutSeconds)
+	if state, err := h.getCDCWorkflowState(ctx, workflowID); err == nil && state.SyncFlowOptions != nil {
+		configuredSyncIntervalSeconds = int64(state.SyncFlowOptions.IdleTimeoutSeconds)
+	} else if err != nil {
+		slog.WarnContext(ctx, "unable to get CDC workflow state, using catalog sync interval",
+			slog.String(string(shared.FlowNameKey), flowJobName), slog.Any("error", err))
+	}
+
+	observedAt := time.Now().UTC()
+	srcConn, srcClose, err := connectors.GetByNameAs[*connmongo.MongoConnector](ctx, config.Env, h.pool, config.SourceName)
+	if err != nil {
+		return replicationStatusUnavailableResponse(flowJobName, observedAt, configuredSyncIntervalSeconds, err), nil
+	}
+	defer srcClose(ctx)
+
+	status, err := srcConn.GetReplicationStatus(ctx, flowJobName)
+	if err != nil {
+		return replicationStatusUnavailableResponse(flowJobName, observedAt, configuredSyncIntervalSeconds, err), nil
+	}
+
+	state := protos.ReplicationStatusState_REPLICATION_STATUS_STATE_RUNNING
+	message := ""
+	if !status.CheckpointInitialized {
+		state = protos.ReplicationStatusState_REPLICATION_STATUS_STATE_INITIALIZING
+		message = "Waiting for the first MongoDB checkpoint."
+	}
+	if flowStatus == protos.FlowStatus_STATUS_PAUSED {
+		state = protos.ReplicationStatusState_REPLICATION_STATUS_STATE_PAUSED
+		if message == "" {
+			message = "The mirror is paused. The processed position will not advance until replication resumes."
+		}
+	}
+
+	response := &protos.ReplicationStatusResponse{
+		FlowJobName:                   flowJobName,
+		State:                         state,
+		LagSeconds:                    status.LagSeconds,
+		ObservedAt:                    timestamppb.New(observedAt),
+		ConfiguredSyncIntervalSeconds: configuredSyncIntervalSeconds,
+		Message:                       message,
+		SourceStatus: &protos.ReplicationStatusResponse_Mongo{
+			Mongo: oplogTimestampToProto(*status),
+		},
+	}
+	if status.CheckpointInitialized {
+		response.CheckpointUpdatedAt = timestamppb.New(status.CheckpointUpdatedAt)
+	}
+	return response, nil
 }
 
 // returns truncation, tick size, & number of ticks
